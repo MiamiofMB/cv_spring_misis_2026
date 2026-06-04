@@ -5,10 +5,9 @@ import triton.testing
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=4),
-        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
-        triton.Config({'BLOCK_SIZE': 8192}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
     ],
     key=['N'],
 )
@@ -16,51 +15,95 @@ import triton.testing
 def _ln_fwd_kernel(X, W, B, Out, Mean, Rstd, Xhat,
                    stride_x, stride_w, stride_b, stride_out,
                    N, eps, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    row_start = pid * stride_x
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
+    row_idx = tl.program_id(0)
+    row_start_x = row_idx * stride_x
+    row_start_out = row_idx * stride_out
 
-    x = tl.load(X + row_start + offsets, mask=mask, other=0.0)
-    w = tl.load(W + offsets, mask=mask, other=0.0)
-    b = tl.load(B + offsets, mask=mask, other=0.0)
-
-    sum_x = tl.sum(tl.where(mask, x, 0.0))
+    sum_x = 0.0
+    for block_start in range(0, N, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(X + row_start_x + offsets, mask=mask, other=0.0)
+        sum_x += tl.sum(x)
+    
     mean = sum_x / N
-    var = tl.sum(tl.where(mask, (x - mean) * (x - mean), 0.0)) / N
+
+    var = 0.0
+    for block_start in range(0, N, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x = tl.load(X + row_start_x + offsets, mask=mask, other=0.0)
+        var += tl.sum((x - mean) * (x - mean))
+    
+    var = var / N
     rstd = 1.0 / tl.sqrt(var + eps)
 
-    x_hat = (x - mean) * rstd
-    out = x_hat * w + b
+    for block_start in range(0, N, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        
+        x = tl.load(X + row_start_x + offsets, mask=mask, other=0.0)
+        w = tl.load(W + offsets, mask=mask, other=0.0)
+        b = tl.load(B + offsets, mask=mask, other=0.0)
 
-    tl.store(Out + row_start + offsets, out, mask=mask)
-    tl.store(Mean + pid, mean)
-    tl.store(Rstd + pid, rstd)
-    tl.store(Xhat + row_start + offsets, x_hat, mask=mask)
+        x_hat = (x - mean) * rstd
+        out = x_hat * w + b
 
+        tl.store(Out + row_start_out + offsets, out, mask=mask)
+        tl.store(Xhat + row_start_x + offsets, x_hat, mask=mask)
+
+    tl.store(Mean + row_idx, mean)
+    tl.store(Rstd + row_idx, rstd)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=2),
+    ],
+    key=['N'],
+)
 @triton.jit
 def _ln_bwd_kernel(Dy, W, Xhat, Rstd, DX, DW, DB,
-                   stride_dy, stride_dx, N, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    row_start = pid * stride_dy
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
+                   stride_dy, stride_dx, stride_dw, stride_db,
+                   N, BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0)
+    row_start_dy = row_idx * stride_dy
+    row_start_dx = row_idx * stride_dx
 
-    dy = tl.load(Dy + row_start + offsets, mask=mask, other=0.0)
-    w = tl.load(W + offsets, mask=mask, other=0.0)
-    x_hat = tl.load(Xhat + row_start + offsets, mask=mask, other=0.0)
-    rstd = tl.load(Rstd + pid)
+    sum_dy_w = 0.0
+    sum_dy_w_xhat = 0.0
 
-    dy_w = dy * w
+    for block_start in range(0, N, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        
+        dy = tl.load(Dy + row_start_dy + offsets, mask=mask, other=0.0)
+        w = tl.load(W + offsets, mask=mask, other=0.0)
+        x_hat = tl.load(Xhat + row_start_dx + offsets, mask=mask, other=0.0)
 
-    mean_dy_w = tl.sum(tl.where(mask, dy_w, 0.0)) / N
-    mean_dy_w_xhat = tl.sum(tl.where(mask, dy_w * x_hat, 0.0)) / N
+        dy_w = dy * w
+        sum_dy_w += tl.sum(dy_w)
+        sum_dy_w_xhat += tl.sum(dy_w * x_hat)
 
-    dx = rstd * (dy_w - mean_dy_w - x_hat * mean_dy_w_xhat)
+    mean_dy_w = sum_dy_w / N
+    mean_dy_w_xhat = sum_dy_w_xhat / N
+    rstd = tl.load(Rstd + row_idx)
 
-    tl.store(DX + row_start + offsets, dx, mask=mask)
-    tl.atomic_add(DW + offsets, dy * x_hat, mask=mask)  # FIX: было dy_w * x_hat
-    tl.atomic_add(DB + offsets, dy, mask=mask)
+    for block_start in range(0, N, BLOCK_SIZE):
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        
+        dy = tl.load(Dy + row_start_dy + offsets, mask=mask, other=0.0)
+        w = tl.load(W + offsets, mask=mask, other=0.0)
+        x_hat = tl.load(Xhat + row_start_dx + offsets, mask=mask, other=0.0)
+
+        dy_w = dy * w
+        dx = rstd * (dy_w - mean_dy_w - x_hat * mean_dy_w_xhat)
+        
+        tl.store(DX + row_start_dx + offsets, dx, mask=mask)
+        tl.atomic_add(DW + offsets, dy * x_hat, mask=mask)
+        tl.atomic_add(DB + offsets, dy, mask=mask)
 
 class LayerNormTriton(torch.autograd.Function):
     @staticmethod
@@ -100,8 +143,8 @@ class LayerNormTriton(torch.autograd.Function):
         _ln_bwd_kernel[grid](
             dy, weight, x_hat, rstd,
             dx, dw, db,
-            dy.stride(0), dx.stride(0),
-            N, triton.next_power_of_2(N)
+            dy.stride(0), dx.stride(0), dw.stride(0), db.stride(0),
+            N
         )
 
         return dx, dw, db, None
@@ -115,7 +158,7 @@ def layernorm_forward_torch(x, weight, bias, eps=1e-5):
 
 def test_and_benchmark():
     torch.manual_seed(42)
-    M, N = 1024, 1024
+    M, N = 1024, 4096
     dtype = torch.float32
     device = 'cuda'
 
@@ -129,10 +172,7 @@ def test_and_benchmark():
 
     out_torch = layernorm_forward_torch(x, w, b)
     out_triton = LayerNormTriton.apply(x_triton, w_triton, b_triton)
-
-     
     torch.testing.assert_close(out_triton, out_torch, atol=1e-4, rtol=1e-4)
-     
 
     loss_torch = out_torch.sum()
     loss_torch.backward()
@@ -140,13 +180,10 @@ def test_and_benchmark():
     loss_triton = out_triton.sum()
     loss_triton.backward()
 
-     
     torch.testing.assert_close(x_triton.grad, x.grad, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(w_triton.grad, w.grad, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(b_triton.grad, b.grad, atol=1e-4, rtol=1e-4)
-    
 
-     
     fn_torch = lambda: layernorm_forward_torch(x, w, b)
     fn_triton = lambda: LayerNormTriton.apply(x_triton, w_triton, b_triton)
 
